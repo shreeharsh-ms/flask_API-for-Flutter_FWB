@@ -1,7 +1,15 @@
 [project]
-name = "my-python-api"
+name = "flask_api_for_flutter_fwb"
 version = "0.1.0"
-description = "My Python API on Vercel"
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = []
+description = "Your project description"
+requires-python = ">=3.11,<3.12"
+
+dependencies = [
+    "Flask==3.1.2",
+    "eventlet==0.40.3",
+    "flask-cors==6.0.1",
+    "Flask-JWT-Extended==4.7.1",
+    "Flask-SocketIO==5.5.1",
+    "pymongo==3.11.0",
+    "qrcode==8.2"
+]
