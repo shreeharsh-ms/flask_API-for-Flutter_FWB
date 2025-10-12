@@ -11,5 +11,11 @@ dependencies = [
     "Flask-JWT-Extended==4.7.1",
     "Flask-SocketIO==5.5.1",
     "pymongo==3.11.0",
-    "qrcode==8.2"
+    "qrcode==8.2",
+    "bidict==0.23.1",
+    "blinker==1.9.0",
+    "click==8.1.8",
+    "greenlet==3.2.4",
+    "python-engineio==4.12.3",
+    "python-socketio==5.14.1"
 ]
