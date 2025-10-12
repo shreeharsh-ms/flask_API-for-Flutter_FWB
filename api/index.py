@@ -1,5 +1,4 @@
-import eventlet
-eventlet.monkey_patch()
+
 from flask import Flask, request, jsonify
 from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -25,7 +24,7 @@ jwt = JWTManager(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
+    async_mode="threading", 
     transports=["websocket"]
 )
 
@@ -1596,7 +1595,5 @@ def delete_lost_item(report_id):
         return jsonify({"msg": "Internal server error", "error": str(e)}), 500
 
 if __name__ == '__main__':
-    print("Starting Flask-SocketIO server with eventlet WSGI...")
-    import eventlet
-    import eventlet.wsgi
-    eventlet.wsgi.server(eventlet.listen(('0.0.0.0', 8000)), app)
+    print("Starting Flask-SocketIO server with threading...")
+    socketio.run(app, host='0.0.0.0', port=8000, debug=True)
