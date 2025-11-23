@@ -31,7 +31,7 @@ socketio = SocketIO(
 # -------------------------------
 # MongoDB Setup
 # -------------------------------
-client = MongoClient("mongodb+srv://infoshreeharshshivpuje_db_user:cBIyxliUzqDl1LpM@cluster0.ccjkejl.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
+client = MongoClient("mongodb+srv://infoshreeharshshivpuje_db_user:qetxek-soNfok-pirbu5@cluster0.ccjkejl.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0")
 db = client["flask_auth_db"]
 users_collection = db["users"]
 items_collection = db["items"]
