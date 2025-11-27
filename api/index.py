@@ -24,8 +24,12 @@ jwt = JWTManager(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading", 
-    transports=["websocket"]
+    async_mode="gevent",  # Changed from threading to gevent
+    logger=True,  # Add logging
+    engineio_logger=True,  # Add engineio logging
+    ping_timeout=60,
+    ping_interval=25,
+    max_http_buffer_size=1e8  # Increase buffer size
 )
 
 # -------------------------------
@@ -667,55 +671,104 @@ def dashboard():
 # -------------------------------
 # Message Endpoints
 # -------------------------------
+# REPLACE the entire send_message function:
 @app.route('/messages/send', methods=['POST'])
 @jwt_required()
 def send_message():
-    data = request.get_json()
-    
-    sender_email = get_jwt_identity()
-    sender = users_collection.find_one({"email": sender_email})
-    if not sender:
-        return jsonify({"msg": "Sender not found"}), 404
+    try:
+        user_email = get_jwt_identity()
+        current_user = users_collection.find_one({"email": user_email})
+        
+        if not current_user:
+            return jsonify({"msg": "User not found"}), 404
 
-    receiver_id = data.get("receiver_id")
-    message_text = data.get("message")
-    chat_id = data.get("chat_id")
+        data = request.get_json()
+        if not data:
+            return jsonify({"msg": "No data provided"}), 400
 
-    if not receiver_id:
-        return jsonify({"msg": "receiver_id is required"}), 400
-    if not receiver_id.startswith("FMB_USER_"):
-        return jsonify({"msg": "Invalid receiver_id format"}), 400
-    if not message_text:
-        return jsonify({"msg": "message is required"}), 400
+        chat_id = data.get('chat_id')
+        receiver_id = data.get('receiver_id')
+        message_text = data.get('message')
 
-    if not chat_id:
-        ids = sorted([sender['custom_id'], receiver_id])
-        chat_id = f"CHAT_{ids[0]}_{ids[1]}"
+        if not all([chat_id, receiver_id, message_text]):
+            return jsonify({"msg": "Missing required fields"}), 400
 
-    message_doc = {
-        "chat_id": chat_id,
-        "sender_id": sender["custom_id"],
-        "receiver_id": receiver_id,
-        "message": message_text,
-        "timestamp": datetime.utcnow()
-    }
+        sender_id = current_user["custom_id"]
+        
+        # Create message document with proper ID handling
+        message_doc = {
+            "chat_id": chat_id,
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "message": message_text,
+            "timestamp": datetime.utcnow(),
+            "read": False,
+            "delivered": False
+        }
 
-    result = messages_collection.insert_one(message_doc)
-    
-    socketio.emit('new_message', {
-        'chat_id': chat_id,
-        'sender_id': sender["custom_id"],
-        'receiver_id': receiver_id,
-        'message': message_text,
-        'timestamp': datetime.utcnow().isoformat()
-    }, room=chat_id)
+        # Save to database
+        result = messages_collection.insert_one(message_doc)
+        message_id = str(result.inserted_id)
+        
+        # Prepare WebSocket message with proper ID
+        ws_message = {
+            "chat_id": chat_id,
+            "sender_id": sender_id,
+            "receiver_id": receiver_id,
+            "message": message_text,
+            "timestamp": message_doc["timestamp"].isoformat(),
+            "message_id": message_id,  # Use the actual MongoDB ID
+            "_id": message_id  # Include _id for compatibility
+        }
 
-    return jsonify({
-        "msg": "Message sent successfully",
-        "chat_id": chat_id,
-        "message_id": str(result.inserted_id)
-    }), 201
+        # BROADCAST VIA WEB SOCKET
+        print(f"📢 Broadcasting message to room: {chat_id}")
+        socketio.emit('new_message', ws_message, room=chat_id)
+        
+        # Also notify the specific receiver
+        socketio.emit('new_message', ws_message, room=receiver_id)
 
+        return jsonify({
+            "msg": "Message sent successfully",
+            "message_id": message_id,
+            "chat_id": chat_id,
+            "timestamp": ws_message["timestamp"]
+        }), 201
+
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return jsonify({"msg": "Internal server error"}), 500
+@socketio.on('new_message')  # This handles client-sent messages if needed
+def handle_new_message(data):
+    try:
+        chat_id = data.get('chat_id')
+        message_text = data.get('message')
+        sender_id = data.get('sender_id')
+        
+        print(f"Received real-time message for {chat_id}: {message_text}")
+        
+        # Broadcast to all in the chat room except sender
+        emit('new_message', {
+            'chat_id': chat_id,
+            'sender_id': sender_id,
+            'message': message_text,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=chat_id, include_self=False)
+        
+    except Exception as e:
+        print(f"Error in new_message handler: {e}")
+
+# Add this to your existing WebSocket handlers
+@socketio.on('connect')
+def handle_connect():
+    print(f"✅ Client connected: {request.sid}")
+    emit('connected', {'status': 'connected', 'sid': request.sid})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"❌ Client disconnected: {request.sid}")
+
+# REPLACE the entire get_messages function:
 @app.route('/messages/<chat_id>', methods=['GET'])
 @jwt_required()
 def get_messages(chat_id):
@@ -727,26 +780,27 @@ def get_messages(chat_id):
     current_user_id = current_user["custom_id"]
 
     messages_cursor = messages_collection.find(
-        {"chat_id": chat_id},
-        {"_id": 0}
+        {"chat_id": chat_id}
     ).sort("timestamp", 1)
 
     messages = []
     for msg in messages_cursor:
-        if "timestamp" in msg:
-            ts = msg["timestamp"]
-            if isinstance(ts, datetime):
-                msg["timestamp"] = ts.isoformat()
-
-        msg["is_sender"] = msg["sender_id"] == current_user_id
-        messages.append(msg)
+        message_data = {
+            "sender_id": msg["sender_id"],
+            "receiver_id": msg["receiver_id"],
+            "message": msg["message"],
+            "timestamp": msg["timestamp"].isoformat() if isinstance(msg["timestamp"], datetime) else str(msg["timestamp"]),
+            "message_id": str(msg["_id"]),  # Include message_id as string
+            "_id": str(msg["_id"]),  # Include _id for compatibility
+            "is_sender": msg["sender_id"] == current_user_id
+        }
+        messages.append(message_data)
 
     return jsonify(messages), 200
-
-
 #  -------------------------------
 # Get User Chats
 # -------------------------------
+# REPLACE the get_user_chats function:
 @app.route('/chats', methods=['GET'])
 @jwt_required()
 def get_user_chats():
@@ -757,55 +811,68 @@ def get_user_chats():
         
     user_id = user["custom_id"]
 
-    pipeline = [
-        {
-            "$match": {
-                "$or": [
-                    {"sender_id": user_id},
-                    {"receiver_id": user_id}
-                ]
-            }
-        },
-        {
-            "$sort": {"timestamp": -1}
-        },
-        {
-            "$group": {
-                "_id": "$chat_id",
-                "last_message": {"$first": "$message"},
-                "sender_id": {"$first": "$sender_id"},
-                "receiver_id": {"$first": "$receiver_id"},
-                "timestamp": {"$first": "$timestamp"},
-            }
-        },
-        {
-            "$sort": {"timestamp": -1}
-        }
-    ]
-    
-    chats = list(messages_collection.aggregate(pipeline))
-    
-    chat_list = []
-    for chat in chats:
-        other_user_id = chat["receiver_id"] if chat["sender_id"] == user_id else chat["sender_id"]
-        
-        other_user = users_collection.find_one(
-            {"custom_id": other_user_id}, 
-            {"_id": 0, "full_name": 1, "email": 1}
-        )
-        
-        chat_list.append({
-            "chat_id": chat["_id"],
-            "last_message": chat["last_message"],
-            "sender_id": chat["sender_id"],
-            "receiver_id": chat["receiver_id"],
-            "other_user_name": other_user.get("full_name", "Unknown") if other_user else "Unknown",
-            "other_user_email": other_user.get("email", "") if other_user else "",
-            "timestamp": chat["timestamp"].isoformat() if isinstance(chat["timestamp"], datetime) else str(chat["timestamp"]),
+    try:
+        # Get distinct chat IDs for this user
+        chat_ids = messages_collection.distinct("chat_id", {
+            "$or": [
+                {"sender_id": user_id},
+                {"receiver_id": user_id}
+            ]
         })
+        
+        chat_list = []
+        for chat_id in chat_ids:
+            # Get the last message in this chat
+            last_message = messages_collection.find_one(
+                {"chat_id": chat_id},
+                sort=[("timestamp", -1)]
+            )
+            
+            if not last_message:
+                continue
+                
+            # Determine the other user in the chat
+            if last_message["sender_id"] == user_id:
+                other_user_id = last_message["receiver_id"]
+            else:
+                other_user_id = last_message["sender_id"]
+            
+            # Get other user's info
+            other_user = users_collection.find_one(
+                {"custom_id": other_user_id}, 
+                {"_id": 0, "full_name": 1, "email": 1, "profile_image": 1}
+            )
+            
+            chat_list.append({
+                "chat_id": chat_id,
+                "last_message": last_message["message"],
+                "sender_id": last_message["sender_id"],
+                "receiver_id": last_message["receiver_id"],
+                "other_user_name": other_user.get("full_name", "Unknown") if other_user else "Unknown",
+                "other_user_email": other_user.get("email", "") if other_user else "",
+                "other_user_photo": other_user.get("profile_image", "") if other_user else "",
+                "timestamp": last_message["timestamp"].isoformat() if isinstance(last_message["timestamp"], datetime) else str(last_message["timestamp"]),
+            })
+        
+        # Sort by timestamp descending (newest first)
+        chat_list.sort(key=lambda x: x["timestamp"], reverse=True)
+        
+        return jsonify(chat_list), 200
+        
+    except Exception as e:
+        print(f"Error fetching user chats: {e}")
+        return jsonify({"msg": "Error fetching chats", "error": str(e)}), 500
 
-    return jsonify(chat_list), 200
 
+# ADD this endpoint:
+@app.route('/websocket-health', methods=['GET'])
+def websocket_health():
+    return jsonify({
+        "status": "healthy",
+        "service": "WebSocket",
+        "timestamp": datetime.utcnow().isoformat(),
+        "clients_connected": len(socketio.server.manager.rooms.get('/', {}))
+    }), 200
 # -------------------------------
 # Found Items Endpoints
 # -------------------------------
@@ -1375,6 +1442,144 @@ def handle_join_user_room(data):
     except Exception as e:
         print(f"Error in join_user_room: {e}")
 
+
+# ADD these WebSocket handlers after the existing ones:
+
+@socketio.on('connect')
+def handle_connect():
+    print(f"✅ Client connected: {request.sid}")
+    emit('connected', {'status': 'connected', 'sid': request.sid})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print(f"❌ Client disconnected: {request.sid}")
+
+@socketio.on('join_chat')
+def handle_join_chat(data):
+    try:
+        chat_id = data.get('chat_id')
+        user_id = data.get('user_id')
+        
+        if chat_id:
+            join_room(chat_id)
+            print(f"✅ User {user_id} joined chat room: {chat_id}")
+            emit('user_joined', {
+                'chat_id': chat_id, 
+                'user_id': user_id,
+                'message': 'User joined chat'
+            }, room=chat_id)
+        else:
+            print("❌ No chat_id provided for join_chat")
+    except Exception as e:
+        print(f"❌ Error in join_chat: {e}")
+
+@socketio.on('join_user_room')
+def handle_join_user_room(data):
+    try:
+        user_id = data.get('user_id')
+        if user_id:
+            join_room(user_id)
+            print(f"✅ User joined their personal room: {user_id}")
+    except Exception as e:
+        print(f"❌ Error in join_user_room: {e}")
+
+# Enhanced typing handler
+@socketio.on('typing')
+def handle_typing(data):
+    try:
+        chat_id = data.get('chat_id')
+        user_id = data.get('user_id')
+        is_typing = data.get('is_typing', False)
+        
+        if chat_id and user_id:
+            emit('user_typing', {
+                'user_id': user_id,
+                'is_typing': is_typing,
+                'chat_id': chat_id
+            }, room=chat_id, include_self=False)
+            print(f"✍️ User {user_id} typing in {chat_id}: {is_typing}")
+        else:
+            print("❌ Missing chat_id or user_id in typing event")
+    except Exception as e:
+        print(f"❌ Error in typing handler: {e}")
+
+# Add to your Flask SocketIO events
+# REPLACE the message_delivered and message_read handlers:
+
+@socketio.on('message_delivered')
+def handle_message_delivered(data):
+    try:
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+        user_id = data.get('user_id')
+        
+        if not message_id or not chat_id:
+            print("❌ Missing message_id or chat_id in delivery receipt")
+            return
+
+        # Update message status in database
+        result = messages_collection.update_one(
+            {"_id": ObjectId(message_id)},
+            {"$set": {
+                "delivered": True, 
+                "delivered_at": datetime.utcnow(),
+                "delivered_to": user_id
+            }}
+        )
+        
+        if result.modified_count > 0:
+            print(f"✅ Message {message_id} marked as delivered")
+            
+            # Notify sender
+            emit('message_delivered', {
+                'message_id': message_id,
+                'delivered_at': datetime.utcnow().isoformat(),
+                'delivered_to': user_id,
+                'chat_id': chat_id
+            }, room=chat_id)
+        else:
+            print(f"❌ Failed to update delivery status for message {message_id}")
+        
+    except Exception as e:
+        print(f"❌ Error handling delivery receipt: {e}")
+
+@socketio.on('message_read')
+def handle_message_read(data):
+    try:
+        message_id = data.get('message_id')
+        chat_id = data.get('chat_id')
+        user_id = data.get('user_id')
+        
+        if not message_id or not chat_id or not user_id:
+            print("❌ Missing data in read receipt")
+            return
+
+        # Update message status
+        result = messages_collection.update_one(
+            {"_id": ObjectId(message_id)},
+            {"$set": {
+                "read": True, 
+                "read_at": datetime.utcnow(),
+                "read_by": user_id
+            }}
+        )
+        
+        if result.modified_count > 0:
+            print(f"✅ Message {message_id} marked as read by {user_id}")
+            
+            # Notify sender
+            emit('message_read', {
+                'message_id': message_id,
+                'read_by': user_id,
+                'read_at': datetime.utcnow().isoformat(),
+                'chat_id': chat_id
+            }, room=chat_id)
+        else:
+            print(f"❌ Failed to update read status for message {message_id}")
+        
+    except Exception as e:
+        print(f"❌ Error handling read receipt: {e}")
+
 # -------------------------------
 # Health check endpoint
 # -------------------------------
@@ -1767,6 +1972,17 @@ def validate_qr_change():
         print(f"Error validating QR change: {e}")
         return jsonify({"msg": "Internal server error", "error": str(e)}), 500
 
+# REPLACE the main execution block:
 if __name__ == '__main__':
-    print("Starting Flask-SocketIO server with threading...")
-    socketio.run(app, host='0.0.0.0', port=8000, debug=True)
+    print("🚀 Starting Flask-SocketIO server...")
+    print("📡 WebSocket transport enabled")
+    print("🔧 Using gevent async mode")
+    
+    # For production, use this:
+    socketio.run(
+        app, 
+        host='0.0.0.0', 
+        port=8000, 
+        debug=False,  # Set to False in production
+        allow_unsafe_werkzeug=True
+    )
