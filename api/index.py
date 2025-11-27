@@ -24,12 +24,11 @@ jwt = JWTManager(app)
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="gevent",  # Changed from threading to gevent
-    logger=True,  # Add logging
-    engineio_logger=True,  # Add engineio logging
-    ping_timeout=60,
-    ping_interval=25,
-    max_http_buffer_size=1e8  # Increase buffer size
+    # Remove async_mode entirely for Vercel compatibility
+    logger=False,  # Disable logging in production
+    engineio_logger=False,  # Disable engineio logging
+    ping_timeout=40,
+    ping_interval=25
 )
 
 # -------------------------------
