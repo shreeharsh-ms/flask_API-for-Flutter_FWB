@@ -743,9 +743,13 @@ def get_messages(chat_id):
 
     return jsonify(messages), 200
 
-@app.route('/chats', methods=['GET'])
-@jwt_required()
-def get_user_chats():
+
+#  -------------------------------
+# Get User Chats
+# -------------------------------
+# @app.route('/chats', methods=['GET'])
+# @jwt_required()
+# def get_user_chats():
     user_email = get_jwt_identity()
     user = users_collection.find_one({"email": user_email})
     if not user:
@@ -802,6 +806,374 @@ def get_user_chats():
 
     return jsonify(chat_list), 200
 
+# -------------------------------
+# Enhanced Delete Chat Endpoint (Soft Delete with 6-day retention)
+# -------------------------------
+@app.route('/chats/<chat_id>', methods=['DELETE'])
+@jwt_required()
+def delete_chat(chat_id):
+    try:
+        current_user_email = get_jwt_identity()
+        user = users_collection.find_one({"email": current_user_email})
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        user_id = user["custom_id"]
+        
+        # Verify the user is part of this chat
+        chat_messages = messages_collection.find_one({
+            "chat_id": chat_id,
+            "$or": [
+                {"sender_id": user_id},
+                {"receiver_id": user_id}
+            ]
+        })
+        
+        if not chat_messages:
+            return jsonify({"msg": "Chat not found or access denied"}), 404
+        
+        # Instead of deleting, mark messages as deleted with expiry timestamp
+        expiry_time = datetime.utcnow() + timedelta(days=6)
+        
+        # Update all messages in this chat to mark as deleted
+        result = messages_collection.update_many(
+            {"chat_id": chat_id},
+            {
+                "$set": {
+                    "deleted": True,
+                    "deleted_by": user_id,
+                    "deleted_at": datetime.utcnow(),
+                    "expires_at": expiry_time,
+                    "can_recover": True
+                }
+            }
+        )
+        
+        # Also add to user's deleted_chats for easy retrieval
+        users_collection.update_one(
+            {"custom_id": user_id},
+            {
+                "$addToSet": {
+                    "deleted_chats": {
+                        "chat_id": chat_id,
+                        "deleted_at": datetime.utcnow(),
+                        "expires_at": expiry_time
+                    }
+                },
+                "$set": {"updated_at": datetime.utcnow()}
+            }
+        )
+        
+        # Emit socket event to notify other user
+        socketio.emit('chat_deleted', {
+            'chat_id': chat_id,
+            'deleted_by': user_id,
+            'timestamp': datetime.utcnow().isoformat(),
+            'can_recover': True,
+            'expires_at': expiry_time.isoformat()
+        }, room=chat_id)
+        
+        AppLogger.i(f"Chat {chat_id} soft-deleted by {user_id}, {result.modified_count} messages marked for deletion")
+        
+        return jsonify({
+            "msg": "Chat moved to trash. It will be permanently deleted in 6 days.",
+            "modified_messages": result.modified_count,
+            "chat_id": chat_id,
+            "expires_at": expiry_time.isoformat(),
+            "can_recover": True
+        }), 200
+        
+    except Exception as e:
+        print(f"Error deleting chat: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# Recover Deleted Chat Endpoint
+# -------------------------------
+@app.route('/chats/<chat_id>/recover', methods=['POST'])
+@jwt_required()
+def recover_chat(chat_id):
+    try:
+        current_user_email = get_jwt_identity()
+        user = users_collection.find_one({"email": current_user_email})
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        user_id = user["custom_id"]
+        
+        # Recover messages by removing deletion markers
+        result = messages_collection.update_many(
+            {
+                "chat_id": chat_id,
+                "deleted_by": user_id
+            },
+            {
+                "$unset": {
+                    "deleted": "",
+                    "deleted_by": "",
+                    "deleted_at": "",
+                    "expires_at": "",
+                    "can_recover": ""
+                }
+            }
+        )
+        
+        # Remove from user's deleted_chats
+        users_collection.update_one(
+            {"custom_id": user_id},
+            {
+                "$pull": {
+                    "deleted_chats": {"chat_id": chat_id}
+                },
+                "$set": {"updated_at": datetime.utcnow()}
+            }
+        )
+        
+        # Emit socket event
+        socketio.emit('chat_recovered', {
+            'chat_id': chat_id,
+            'recovered_by': user_id,
+            'timestamp': datetime.utcnow().isoformat()
+        }, room=chat_id)
+        
+        AppLogger.i(f"Chat {chat_id} recovered by {user_id}, {result.modified_count} messages restored")
+        
+        return jsonify({
+            "msg": "Chat recovered successfully",
+            "recovered_messages": result.modified_count,
+            "chat_id": chat_id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error recovering chat: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# Get Deleted Chats Endpoint
+# -------------------------------
+@app.route('/chats/deleted', methods=['GET'])
+@jwt_required()
+def get_deleted_chats():
+    try:
+        current_user_email = get_jwt_identity()
+        user = users_collection.find_one({"email": current_user_email})
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        user_id = user["custom_id"]
+        
+        # Get user's deleted chats
+        deleted_chats = user.get('deleted_chats', [])
+        
+        # Filter out expired chats
+        current_time = datetime.utcnow()
+        valid_deleted_chats = [
+            chat for chat in deleted_chats 
+            if chat.get('expires_at', current_time) > current_time
+        ]
+        
+        # Get chat details for valid deleted chats
+        chat_list = []
+        for deleted_chat in valid_deleted_chats:
+            chat_id = deleted_chat['chat_id']
+            
+            # Get the last message from this chat (even if deleted)
+            last_message = messages_collection.find_one(
+                {"chat_id": chat_id},
+                sort=[("timestamp", -1)]
+            )
+            
+            if last_message:
+                other_user_id = last_message["receiver_id"] if last_message["sender_id"] == user_id else last_message["sender_id"]
+                
+                other_user = users_collection.find_one(
+                    {"custom_id": other_user_id}, 
+                    {"_id": 0, "full_name": 1, "email": 1, "profile_image": 1}
+                )
+                
+                chat_list.append({
+                    "chat_id": chat_id,
+                    "last_message": last_message.get("message", ""),
+                    "other_user_name": other_user.get("full_name", "Unknown") if other_user else "Unknown",
+                    "other_user_email": other_user.get("email", "") if other_user else "",
+                    "other_user_photo": other_user.get("profile_image", "") if other_user else "",
+                    "deleted_at": deleted_chat.get('deleted_at'),
+                    "expires_at": deleted_chat.get('expires_at'),
+                    "days_remaining": (deleted_chat.get('expires_at') - current_time).days
+                })
+        
+        return jsonify({"deleted_chats": chat_list}), 200
+        
+    except Exception as e:
+        print(f"Error fetching deleted chats: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# Permanent Delete Chat Endpoint (Admin/Manual)
+# -------------------------------
+@app.route('/chats/<chat_id>/permanent', methods=['DELETE'])
+@jwt_required()
+def permanent_delete_chat(chat_id):
+    try:
+        current_user_email = get_jwt_identity()
+        user = users_collection.find_one({"email": current_user_email})
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        user_id = user["custom_id"]
+        
+        # Permanently delete all messages in this chat
+        result = messages_collection.delete_many({"chat_id": chat_id})
+        
+        # Remove from user's deleted_chats
+        users_collection.update_one(
+            {"custom_id": user_id},
+            {
+                "$pull": {
+                    "deleted_chats": {"chat_id": chat_id}
+                },
+                "$set": {"updated_at": datetime.utcnow()}
+            }
+        )
+        
+        # Close socket room
+        socketio.close_room(chat_id)
+        
+        AppLogger.i(f"Chat {chat_id} permanently deleted by {user_id}, {result.deleted_count} messages removed")
+        
+        return jsonify({
+            "msg": "Chat permanently deleted",
+            "deleted_messages": result.deleted_count,
+            "chat_id": chat_id
+        }), 200
+        
+    except Exception as e:
+        print(f"Error permanently deleting chat: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# Background Task to Clean Expired Chats
+# -------------------------------
+def cleanup_expired_chats():
+    """
+    Background task to permanently delete chats that have expired
+    Run this daily using a scheduler
+    """
+    try:
+        current_time = datetime.utcnow()
+        
+        # Find all messages that have expired
+        expired_messages = messages_collection.find({
+            "expires_at": {"$lt": current_time},
+            "deleted": True
+        })
+        
+        # Group by chat_id to delete entire chats
+        chat_ids_to_delete = set()
+        for message in expired_messages:
+            chat_ids_to_delete.add(message['chat_id'])
+        
+        # Delete all messages in expired chats
+        total_deleted = 0
+        for chat_id in chat_ids_to_delete:
+            result = messages_collection.delete_many({"chat_id": chat_id})
+            total_deleted += result.deleted_count
+            
+            # Remove from all users' deleted_chats
+            users_collection.update_many(
+                {},
+                {
+                    "$pull": {
+                        "deleted_chats": {"chat_id": chat_id}
+                    }
+                }
+            )
+            
+            # Close socket room
+            socketio.close_room(chat_id)
+            
+            AppLogger.i(f"Auto-deleted expired chat {chat_id}, {result.deleted_count} messages removed")
+        
+        AppLogger.i(f"Cleanup completed: {total_deleted} messages from {len(chat_ids_to_delete)} chats permanently deleted")
+        
+    except Exception as e:
+        print(f"Error in chat cleanup: {e}")
+
+# -------------------------------
+# Enhanced Get User Chats (Exclude Deleted Ones)
+# -------------------------------
+@app.route('/chats', methods=['GET'])
+@jwt_required()
+def get_user_chats():
+    user_email = get_jwt_identity()
+    user = users_collection.find_one({"email": user_email})
+    if not user:
+        return jsonify({"msg": "User not found"}), 404
+        
+    user_id = user["custom_id"]
+    
+    # Get user's deleted chat IDs
+    deleted_chats = [chat['chat_id'] for chat in user.get('deleted_chats', [])]
+    
+    pipeline = [
+        {
+            "$match": {
+                "$or": [
+                    {"sender_id": user_id},
+                    {"receiver_id": user_id}
+                ],
+                "deleted": {"$ne": True}  # Exclude deleted messages
+            }
+        },
+        {
+            "$sort": {"timestamp": -1}
+        },
+        {
+            "$group": {
+                "_id": "$chat_id",
+                "last_message": {"$first": "$message"},
+                "sender_id": {"$first": "$sender_id"},
+                "receiver_id": {"$first": "$receiver_id"},
+                "timestamp": {"$first": "$timestamp"},
+            }
+        },
+        {
+            "$match": {
+                "_id": {"$nin": deleted_chats}  # Exclude deleted chats
+            }
+        },
+        {
+            "$sort": {"timestamp": -1}
+        }
+    ]
+    
+    chats = list(messages_collection.aggregate(pipeline))
+    
+    chat_list = []
+    for chat in chats:
+        other_user_id = chat["receiver_id"] if chat["sender_id"] == user_id else chat["sender_id"]
+        
+        other_user = users_collection.find_one(
+            {"custom_id": other_user_id}, 
+            {"_id": 0, "full_name": 1, "email": 1, "profile_image": 1}
+        )
+        
+        chat_list.append({
+            "chat_id": chat["_id"],
+            "last_message": chat["last_message"],
+            "sender_id": chat["sender_id"],
+            "receiver_id": chat["receiver_id"],
+            "other_user_name": other_user.get("full_name", "Unknown") if other_user else "Unknown",
+            "other_user_email": other_user.get("email", "") if other_user else "",
+            "other_user_photo": other_user.get("profile_image", "") if other_user else "",
+            "timestamp": chat["timestamp"].isoformat() if isinstance(chat["timestamp"], datetime) else str(chat["timestamp"]),
+        })
+
+    return jsonify(chat_list), 200
 # -------------------------------
 # Found Items Endpoints
 # -------------------------------
@@ -1684,6 +2056,84 @@ def generate_user_qr(user_custom_id):
     except Exception as e:
         print(f"Error generating QR code: {e}")
         return None
+
+
+# -------------------------------
+# Get QR Code Change History (Optional)
+# -------------------------------
+@app.route('/user/qr-code-history', methods=['GET'])
+@jwt_required()
+def get_qr_code_history():
+    try:
+        current_user_email = get_jwt_identity()
+        
+        user = users_collection.find_one(
+            {"email": current_user_email},
+            {"qr_code_history": 1, "custom_id": 1, "created_at": 1, "qr_code": 1}
+        )
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        history = {
+            "current_custom_id": user.get('custom_id'),
+            "account_created": user.get('created_at'),
+            "current_qr_code": user.get('qr_code'),
+            "last_qr_change": user.get('qr_code_history', {})
+        }
+        
+        return jsonify(history), 200
+        
+    except Exception as e:
+        print(f"Error fetching QR code history: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# Validate QR Code Before Change (Optional Security Feature)
+# -------------------------------
+@app.route('/user/validate-qr-change', methods=['POST'])
+@jwt_required()
+def validate_qr_change():
+    """
+    Validate if user can change QR code (rate limiting, security checks)
+    """
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Retrieve user's QR code history
+        user = users_collection.find_one(
+            {"email": current_user_email},
+            {"qr_code_history": 1}
+        )
+        
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        qr_history = user.get('qr_code_history', {})
+        
+        # Rate limiting: Only allow QR code change once per 24 hours
+        changed_at = qr_history.get('changed_at')
+        if changed_at:
+            if isinstance(changed_at, str):
+                changed_at = datetime.fromisoformat(changed_at.replace('Z', '+00:00'))
+            
+            time_since_last_change = datetime.now(timezone.utc) - changed_at
+            if time_since_last_change < timedelta(hours=24):
+                hours_remaining = 24 - (time_since_last_change.total_seconds() / 3600)
+                return jsonify({
+                    "can_change": False,
+                    "msg": f"QR code can only be changed once every 24 hours. Please wait {hours_remaining:.1f} more hours.",
+                    "wait_time_hours": round(hours_remaining, 1)
+                }), 429
+        
+        return jsonify({
+            "can_change": True,
+            "msg": "QR code change is allowed"
+        }), 200
+        
+    except Exception as e:
+        print(f"Error validating QR change: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
 
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server with threading...")
