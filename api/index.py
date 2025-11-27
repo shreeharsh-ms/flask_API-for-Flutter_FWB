@@ -1594,6 +1594,97 @@ def delete_lost_item(report_id):
         print(f"Error deleting lost item: {e}")
         return jsonify({"msg": "Internal server error", "error": str(e)}), 500
 
+
+# -------------------------------
+# Change QR Code Endpoint (No PIL)
+# -------------------------------
+@app.route('/user/change-qr-code', methods=['POST'])
+@jwt_required()
+def change_qr_code():
+    try:
+        current_user_email = get_jwt_identity()
+        
+        # Find the user
+        user = users_collection.find_one({"email": current_user_email})
+        if not user:
+            return jsonify({"msg": "User not found"}), 404
+        
+        # Get the reason for QR code change (optional)
+        data = request.get_json()
+        reason = data.get('reason', 'User requested change')
+        
+        # Generate new custom ID
+        new_custom_id = f"FMB_USER_{uuid.uuid4().hex[:8]}"
+        
+        # Generate new QR code without PIL
+        new_qr_base64 = generate_user_qr(new_custom_id)  # <-- existing function, no PIL
+        
+        # Update user document with new QR code and custom ID
+        update_result = users_collection.update_one(
+            {"email": current_user_email},
+            {
+                "$set": {
+                    "custom_id": new_custom_id,
+                    "qr_code": new_qr_base64,
+                    "updated_at": datetime.now(timezone.utc),
+                    "qr_code_history": {
+                        "previous_custom_id": user.get('custom_id'),
+                        "change_reason": reason,
+                        "changed_at": datetime.now(timezone.utc)
+                    }
+                }
+            }
+        )
+        
+        if update_result.modified_count > 0:
+            # Log the QR code change
+            print(f"QR code changed for user: {current_user_email}")
+            print(f"Old custom_id: {user.get('custom_id')}")
+            print(f"New custom_id: {new_custom_id}")
+            print(f"Reason: {reason}")
+            
+            return jsonify({
+                "msg": "QR code changed successfully",
+                "new_custom_id": new_custom_id,
+                "new_qr_code": new_qr_base64,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }), 200
+        else:
+            return jsonify({"msg": "Failed to update QR code"}), 500
+            
+    except Exception as e:
+        print(f"Error changing QR code: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+# -------------------------------
+# QR Code Generation (No PIL)
+# -------------------------------
+def generate_user_qr(user_custom_id):
+    """
+    Generate a QR code as base64 string WITHOUT using PIL
+    """
+    import qrcode
+    import qrcode.image.svg
+    from io import BytesIO
+    import base64
+    
+    try:
+        # Add timestamp to QR to make it unique per generation
+        timestamp = int(datetime.now(timezone.utc).timestamp())
+        qr_data = f"{user_custom_id}|{timestamp}"
+        
+        # Use SVG factory (pure Python, no C extensions)
+        factory = qrcode.image.svg.SvgImage
+        qr_img = qrcode.make(qr_data, image_factory=factory)
+        
+        buffered = BytesIO()
+        qr_img.save(buffered)
+        qr_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        return qr_base64
+    except Exception as e:
+        print(f"Error generating QR code: {e}")
+        return None
+
 if __name__ == '__main__':
     print("Starting Flask-SocketIO server with threading...")
     socketio.run(app, host='0.0.0.0', port=8000, debug=True)
